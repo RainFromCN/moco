@@ -32,10 +32,16 @@ def main_worker(local_rank, local_world_size, args):
     model = moco.MoCo(encoder, args.embed_dim, args.num_neg_samples)
     model = model.cuda(local_rank)
     loss = torch.nn.CrossEntropyLoss().cuda(local_rank)
-    if args.use_ddp: model = DDP(model, device_ids=[local_rank])
+
+    # 将模型使用DDP进行装饰
+    if args.use_ddp: 
+        model = DDP(model, device_ids=[local_rank])
+        module = model.module
+    else:
+        module = model
 
     # 定义优化器
-    optimizer = torch.optim.SGD(params=model.get_parameters(), momentum=args.momentum)
+    optimizer = torch.optim.SGD(params=module.get_parameters(), momentum=args.momentum)
 
     # 加载数据
     aug = data.TwoCropsWrapper(data.MoCoDataAugmentation())
@@ -63,7 +69,7 @@ def main_worker(local_rank, local_world_size, args):
             optimizer.step()
 
             # 更新key encoder
-            utils.update_key_encoder(model, args)
+            utils.update_key_encoder(module, args)
 
 
 if __name__ == '__main__':
