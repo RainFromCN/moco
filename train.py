@@ -25,24 +25,23 @@ def main_worker(local_rank, local_world_size, args):
     local_rank : 进程在本机的ID
     local_world_size : 本机共有多少进程
     """
-    # 将该进程加入DDP通信组
-    utils.setup_ddp(local_rank, local_world_size, args)
-
     # 定义模型
     encoder = models.__dict__[args.arch]
-    model = moco.MoCo(encoder, args.embed_dim, args.num_neg_samples)
+    model = moco.MoCo(encoder, args.embed_dim, args.num_neg_samples, args.temp, args.use_ddp)
     model = model.cuda(local_rank)
     loss = torch.nn.CrossEntropyLoss().cuda(local_rank)
 
     # 将模型使用DDP进行装饰
-    if args.use_ddp: 
+    if args.use_ddp:
+        utils.setup_ddp(local_rank, local_world_size, args)
         model = DDP(model, device_ids=[local_rank])
         module = model.module
     else:
         module = model
 
     # 定义优化器
-    optimizer = torch.optim.SGD(params=module.get_parameters(), momentum=args.momentum)
+    optimizer = torch.optim.SGD(params=module.get_parameters(), momentum=args.momentum,
+                                lr=args.lr)
 
     # 加载数据
     aug = data.TwoCropsWrapper(data.MoCoDataAugmentation())
@@ -76,9 +75,8 @@ def main_worker(local_rank, local_world_size, args):
 
             # 输出信息
             if local_rank == 0:
-                image_s = args.batch_size(time.time() - mark)
-                image_s *= local_world_size * args.num_nodes
-                print(f"Iter-{iter}\t{image_s} Images/s")
+                image_s = args.batch_size / (time.time() - mark)
+                print(f"Iter-{iter}\t{image_s} Images/s per GPU")
                 mark = time.time()
 
 

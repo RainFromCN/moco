@@ -6,7 +6,7 @@ from torch.distributed import all_gather
 
 
 class MoCo(nn.Module):
-    def __init__(self, encoder, embed_dim, num_neg_samples, temp):
+    def __init__(self, encoder, embed_dim, num_neg_samples, temp, use_ddp):
         """
         MoCo
 
@@ -18,6 +18,7 @@ class MoCo(nn.Module):
         """
         super().__init__()
         self.temp = temp
+        self.use_ddp = use_ddp
 
         # 设置neg samples队列
         self.register_buffer("queue", torch.rand(num_neg_samples, embed_dim))
@@ -31,7 +32,8 @@ class MoCo(nn.Module):
         self.key_encoder.fc = nn.LazyLinear(embed_dim)
 
         # 加载模型参数
-        for param_q, param_k in zip(self.query_encoder, self.key_encoder):
+        for param_q, param_k in zip(self.query_encoder.parameters(), 
+                                    self.key_encoder.parameters()):
             param_q.data.copy_(param_k.data)
 
 
@@ -40,19 +42,21 @@ class MoCo(nn.Module):
     
 
     def update_queue(self, key_feat):
-        # 获取进程总数
-        global_world_size = torch.distributed.get_world_size()
-        # 开辟缓存区
-        tensor_list = [torch.zeros_like(key_feat) for _ in range(global_world_size)]
-        # 汇聚同类项
-        all_gather(tensor_list, key_feat)
-        key_feat_gather = torch.cat(tensor_list, dim=0)
-        global_batch_size = key_feat_gather.shape[0]
+        if self.use_ddp:
+            # 获取进程总数
+            global_world_size = torch.distributed.get_world_size()
+            # 开辟缓存区
+            tensor_list = [torch.zeros_like(key_feat) for _ in range(global_world_size)]
+            # 汇聚同类项
+            all_gather(tensor_list, key_feat)
+            key_feat = torch.cat(tensor_list, dim=0)
+
         # 更新队列
-        assert self.queue.shape[0] % global_batch_size
+        batch_size = key_feat.shape[0]
+        assert self.queue.shape[0] % batch_size == 0
         ptr = int(self.ptr)
-        self.queue[ptr: ptr + global_batch_size] = key_feat_gather
-        self.ptr[0] = (ptr + global_batch_size) % self.queue.shape[0]
+        self.queue[ptr: ptr + batch_size] = key_feat
+        self.ptr[0] = (ptr + batch_size) % self.queue.shape[0]
 
 
     def forward(self, query_image, key_image):
