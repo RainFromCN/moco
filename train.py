@@ -1,5 +1,6 @@
 import logging
 import os
+import time
 
 import torch
 import torch.multiprocessing as mp
@@ -50,6 +51,8 @@ def main_worker(local_rank, local_world_size, args):
     loader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler, shuffle=False,
                         pin_memory=True, num_workers=args.num_workers, drop_last=True)
     
+    mark = time.time()
+    
     # 开始训练
     for epoch in range(args.epochs):
         # 进行每个epoch必要的设置
@@ -70,6 +73,13 @@ def main_worker(local_rank, local_world_size, args):
 
             # 更新key encoder
             utils.update_key_encoder(module, args)
+
+            # 输出信息
+            if local_rank == 0:
+                image_s = args.batch_size(time.time() - mark)
+                image_s *= local_world_size * args.num_nodes
+                print(f"Iter-{iter}\t{image_s} Images/s")
+                mark = time.time()
 
 
 if __name__ == '__main__':
