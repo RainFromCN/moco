@@ -39,3 +39,5 @@ parser.add_argument("--dist_backend", default="nccl", type=str)
 
 # MISC
 parser.add_argument("--output_dir", default="./output", type=str)
+parser.add_argument("--save_ckp_freq", default=1, type=int)
+parser.add_argument("--use_ckp", default=None, type=str)

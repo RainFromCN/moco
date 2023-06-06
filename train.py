@@ -9,6 +9,7 @@ import  torchvision.datasets as datasets
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+from torch.distributed import destroy_process_group
 
 import config
 import utils
@@ -50,10 +51,20 @@ def main_worker(local_rank, local_world_size, args):
     loader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler, shuffle=False,
                         pin_memory=True, num_workers=args.num_workers, drop_last=True)
     
+    # 检查是否使用check point
     mark = time.time()
+    if args.use_ckp:
+        assert args.use_ckp.startswith("checkpoint-")
+        assert args.use_ckp.endswith(".pth")
+        start_epoch = int(args.use_ckp.lstrip("checkpoint-").rstrip(".pth"))
+        path = os.path.join(args.output_dir, args.use_ckp)
+        module.load_state_dict(torch.load(path))
+    else:
+        start_epoch = 0
+
     
     # 开始训练
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         # 进行每个epoch必要的设置
         if args.use_ddp: sampler.set_epoch(epoch)
         utils.adjust_learning_rate(optimizer, epoch, args)
@@ -78,6 +89,12 @@ def main_worker(local_rank, local_world_size, args):
                 image_s = args.batch_size / (time.time() - mark)
                 print(f"Iter-{iter}\t{image_s} Images/s per GPU")
                 mark = time.time()
+            
+        if epoch % args.save_ckp_freq == 0:
+            path = os.path.join(args.output_dir, f'checkpoint-{epoch}.pth')
+            torch.save(module.state_dict(), path)
+
+        destroy_process_group()
 
 
 if __name__ == '__main__':
