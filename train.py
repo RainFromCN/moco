@@ -37,12 +37,17 @@ def main_worker(local_rank, local_world_size, args):
         utils.setup_ddp(local_rank, local_world_size, args)
         model = DDP(model, device_ids=[local_rank])
         module = model.module
+        # Run a dummy forward pass to initlize the parameters
+        dummy_query = torch.rand(16, 3, 224, 224).cuda(local_rank)
+        dummy_key = torch.rand(16, 3, 224, 224).cuda(local_rank)
+        _, _ = module(dummy_query, dummy_key)
     else:
         module = model
 
     # 定义优化器
     optimizer = torch.optim.SGD(params=module.get_parameters(), momentum=args.momentum,
                                 lr=args.lr)
+    scalar = torch.cuda.amp.GradScalar()
 
     # 加载数据
     aug = data.TwoCropsWrapper(data.MoCoDataAugmentation())
@@ -73,13 +78,15 @@ def main_worker(local_rank, local_world_size, args):
             query_image, key_image = images[0].cuda(local_rank), images[1].cuda(local_rank)
             
             # 获取模型的输出
-            output, target = model(query_image, key_image)
-            l = loss(output, target)
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                output, target = model(query_image, key_image)
+                l = loss(output, target)
 
             # 更新query encoder
             optimizer.zero_grad()
-            l.backward()
-            optimizer.step()
+            scalar.scale(l).backward()
+            scalar.step(optimizer)
+            scalar.update()
 
             # 更新key encoder
             utils.update_key_encoder(module, args)
