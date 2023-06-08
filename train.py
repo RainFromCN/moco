@@ -15,6 +15,7 @@ import config
 import utils
 import moco
 import data
+import time
 
 
 def main_worker(local_rank, local_world_size, args):
@@ -26,6 +27,9 @@ def main_worker(local_rank, local_world_size, args):
     local_rank : 进程在本机的ID
     local_world_size : 本机共有多少进程
     """
+    if local_rank != 0:
+        time.sleep(1)
+    
     # 定义模型
     encoder = models.__dict__[args.arch]
     model = moco.MoCo(encoder, args.embed_dim, args.num_neg_samples, args.temp, args.use_ddp)
@@ -37,23 +41,20 @@ def main_worker(local_rank, local_world_size, args):
         utils.setup_ddp(local_rank, local_world_size, args)
         model = DDP(model, device_ids=[local_rank])
         module = model.module
-        # Run a dummy forward pass to initlize the parameters
-        dummy_query = torch.rand(16, 3, 224, 224).cuda(local_rank)
-        dummy_key = torch.rand(16, 3, 224, 224).cuda(local_rank)
-        _, _ = module(dummy_query, dummy_key)
     else:
         module = model
 
     # 定义优化器
     optimizer = torch.optim.SGD(params=module.get_parameters(), momentum=args.momentum,
-                                lr=args.lr)
-    scalar = torch.cuda.amp.GradScalar()
+                                lr=args.lr, weight_decay=args.weight_decay)
+    scaler = torch.cuda.amp.GradScaler()
 
     # 加载数据
     aug = data.TwoCropsWrapper(data.MoCoDataAugmentation())
     dataset = datasets.ImageFolder(root=args.path, transform=aug)
     sampler = DistributedSampler(dataset) if args.use_ddp else None
-    loader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler, shuffle=False,
+    loader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler, 
+                        shuffle=False if args.use_ddp else True,
                         pin_memory=True, num_workers=args.num_workers, drop_last=True)
     
     # 检查是否使用check point
@@ -64,15 +65,18 @@ def main_worker(local_rank, local_world_size, args):
         start_epoch = int(args.use_ckp.lstrip("checkpoint-").rstrip(".pth"))
         path = os.path.join(args.output_dir, args.use_ckp)
         module.load_state_dict(torch.load(path))
+        logging.info(f"Use {args.use_ckp} to training.")
     else:
         start_epoch = 0
-
     
     # 开始训练
     for epoch in range(start_epoch, args.epochs):
         # 进行每个epoch必要的设置
         if args.use_ddp: sampler.set_epoch(epoch)
         utils.adjust_learning_rate(optimizer, epoch, args)
+
+        if local_rank == 0:
+            history_loss = []
 
         for iter, (images, _) in enumerate(loader):
             query_image, key_image = images[0].cuda(local_rank), images[1].cuda(local_rank)
@@ -84,20 +88,26 @@ def main_worker(local_rank, local_world_size, args):
 
             # 更新query encoder
             optimizer.zero_grad()
-            scalar.scale(l).backward()
-            scalar.step(optimizer)
-            scalar.update()
+            scaler.scale(l).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
             # 更新key encoder
             utils.update_key_encoder(module, args)
 
-            # 输出信息
+            # 在控制台输出信息
             if local_rank == 0:
                 image_s = args.batch_size / (time.time() - mark)
                 print(f"Iter-{iter}\t{image_s} Images/s per GPU")
                 mark = time.time()
-            
+                history_loss.append(l.item())
+        
+        if local_rank == 0:
+            # 保存epoch的训练日志
+            logging.info(f"Epoch:[{epoch}/{args.epochs}]  Loss:{sum(history_loss) / len(history_loss): .5f}")
+
         if epoch % args.save_ckp_freq == 0:
+            # 保存checkpoint
             path = os.path.join(args.output_dir, f'checkpoint-{epoch}.pth')
             torch.save(module.state_dict(), path)
 
@@ -110,7 +120,7 @@ if __name__ == '__main__':
 
     # 检查DDP参数是否正确
     if (args.use_ddp and args.master_addr and args.master_port 
-        and args.num_nodes and args.this_node_id):
+        and args.num_nodes is not None and args.this_node_id is not None):
         logging.info("Use ddp for training.")
     else:
         args.use_ddp = False

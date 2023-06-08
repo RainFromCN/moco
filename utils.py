@@ -3,7 +3,7 @@ import pathlib
 import os
 
 import torch
-from torch.distributed import init_process_group
+from torch.distributed import init_process_group, get_world_size, all_gather, get_rank, broadcast
 
 
 
@@ -20,6 +20,7 @@ def setup_ddp(local_rank, local_world_size, args):
                        rank=global_rank, world_size=global_world_size)
 
 
+@torch.no_grad()
 def update_key_encoder(model, args):
     m = args.key_encoder_momentum
     for param_q, param_k in zip(model.query_encoder.parameters(), 
@@ -35,3 +36,36 @@ def adjust_learning_rate(optimizer, epoch, args):
             lr *= 0.1
     for group in optimizer.param_groups:
         group["lr"] = lr
+
+
+@torch.no_grad()
+def concat_all_gather(x):
+    x_list = [torch.zeros_like(x) for _ in range(get_world_size())]
+    all_gather(x_list, x, async_op=False)
+    return torch.cat(x_list, dim=0)
+
+
+@torch.no_grad()
+def shuffle(x, use_ddp):
+    if use_ddp:
+        x_gather = concat_all_gather(x)
+        indices = torch.randperm(x_gather.shape[0]).to(x.device)
+        broadcast(indices, src=0)
+        start = get_rank() * x.shape[0]
+        local_indices = indices[start: start + x.shape[0]]
+        return x_gather[local_indices], indices
+    else:
+        indices = torch.randperm(x.shape[0]).to(x.device)
+        return x[indices], indices
+
+
+@torch.no_grad()
+def unshuffle(x, indices, use_ddp):
+    if use_ddp:
+        x_gather = concat_all_gather(x)
+        start = get_rank() * x.shape[0]
+        reverse_indices = torch.argsort(indices)
+        local_reverse_indices = reverse_indices[start: start + x.shape[0]]
+        return x_gather[local_reverse_indices]
+    else:
+        return x[torch.argsort(indices)]
