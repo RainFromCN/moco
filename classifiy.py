@@ -3,6 +3,7 @@ import argparse
 import pathlib
 import torch
 import torchvision.models as models
+import torch.nn as nn
 import torchvision.transforms as T
 from torchvision.datasets import ImageFolder
 from torch.utils.data import DataLoader, DistributedSampler
@@ -13,15 +14,40 @@ import torch.multiprocessing as mp
 import utils
 
 
-class Head(torch.nn.Module):
-    def __init__(self, embed_dim, num_cls):
-        self.linear = torch.nn.Linear(embed_dim, num_cls)
-        torch.nn.init.xavier_uniform_(self.linear.weight.data)
-        torch.nn.init.constant_(self.linear.bias.data, 0)
+class Classifer(torch.nn.Module):
+    def __init__(self, args):
+        self.backbone = models.__dict__[args.arch]
+        self.backbone.fc = nn.Linear(self.backbone.fc.in_features, args.num_cls)
 
-    def forward(self, x):
-        return self.linear(x)
+        # 将主干网络的冻结
+        for name, param in self.backbone.named_parameters():
+            if not name.startswith("fc"):
+                param.requires_grad_(False)
+
+        # 加载backbone的预训练参数
+        path = os.path.join(args.output_dir, "pretrain", args.pretrain)
+        assert os.path.exists(path)
+        state_dict = torch.load(path, map_location='cpu')
+        for key, value in list(state_dict.items()):
+            if key.startswith("query_encoder") and not key.startswith("query_encoder.fc"):
+                state_dict[key.lstrip("query_encoder.")] = value
+            del state_dict[key]
+        msg = self.backbone.load_state_dict(state_dict, strict=False)
+        assert set(msg.missing_keys) == {"fc.weight", "fc.bias"}
+        
+        # 初始化全连接层
+        if args.use_ckp:
+            assert args.use_ckp.startswith("checkpoint-") and args.use_ckp.endswith(".pth")
+            path = os.path.join(args.output_dir, "classify", args.use_ckp)
+            self.backbone.fc.load_state_dict(torch.load(path, map_location='cpu'))
+        else:
+            nn.init.xavier_uniform_(self.backbone.fc.weight)
+            nn.init.constant_(self.backbone.fc.bias)
+
     
+    def forward(self, x):
+        return self.backbone(x)
+
 
 class Augmentation:
     def __init__(self):
@@ -39,14 +65,15 @@ def config_parser():
 
     # MISC
     parser.add_argument("path", type=str)
-    parser.add_argument("model", type=str)
+    parser.add_argument("pretrain", type=str)
     parser.add_argument("--output_dir", default='./output', type=str)
     parser.add_argument("--num_workers", default=16, type=int)
     parser.add_argument("--save_ckp_freq", default=1, type=int)
+    parser.add_argument("--use_ckp", default=None, type=str)
 
     # 模型
     parser.add_argument("--arch", default="resnet50", type=str)
-    parser.add_argument("--embed_dim", default=128, type=int)
+    parser.add_argument("--embed_dim", default=256, type=int)
     parser.add_argument("--num_cls", default=1000, type=int)
 
     # 训练
@@ -54,7 +81,8 @@ def config_parser():
     parser.add_argument("--weight_decay", default=0, type=float)
     parser.add_argument("--momentum", default=0.9, type=float)
     parser.add_argument("--batch_size", default=128, type=int)
-    parser.add_argument("--epochs", default=10, type=int)
+    parser.add_argument("--epochs", default=100, type=int)
+    parser.add_argument("--schedule", nargs='*', default=[60, 80], type=int)
     
     # 分布式
     parser.add_argument("--use_ddp", default=True, type=bool)
@@ -69,24 +97,8 @@ def config_parser():
 
 def main_worker(local_rank, local_world_size, args):
 
-    # 加载backbone
-    assert args.model.startswith('checkpoint-') and args.model.endswith('.pth')
-    module = models.__dict__[args.arch]
-    module.fc = torch.nn.Linear(in_features=module.fc.in_features, out_features=args.embed_dim)
-    for param in module.parameters():
-        param.requires_grad_(False)
-
-    # 加载预训练参数
-    path = os.path.join(args.output_dir, "pretrain", args.model)
-    state_dict = torch.load(path, map_location='cpu')
-    for name, param in module.named_parameters():
-        param.data.copy_(state_dict[f"key_encoder.{name}"])
-    for name, buffer in module.named_buffers():
-        buffer.data.copy_(state_dict[f"key_encoder.{name}"])
-
-    # 加载映射头并迁移至GPU
-    module = Head(args.embed_dim, args.num_cls)(module)
-    module = module.cuda(local_rank)
+    # 加载模型
+    module = Classifer(args).cuda(local_rank)
     loss = torch.nn.CrossEntropyLoss().cuda(local_rank)
 
     # 加载优化器
@@ -106,12 +118,15 @@ def main_worker(local_rank, local_world_size, args):
         utils.print("Use ddp for training.")
         model = torch.nn.parallel.DistributedDataParallel(module, device_ids=[local_rank])
     else:
-        utils.print(f"Use single GPU for training.")
+        utils.print("Use single GPU for training.")
         model = module
 
 
     # 开始训练
     for epoch in range(args.epochs):
+
+        utils.adjust_learning_rate(optimizer, epoch, args)
+
         for i, (data, label) in enumerate(loader):
             data, label = data.cuda(local_rank), label.cuda(local_rank)
 
@@ -129,7 +144,7 @@ def main_worker(local_rank, local_world_size, args):
 
         if epoch % args.save_ckp_freq == 0:
             path = os.path.join(args.output_dir, "classify", "checkpoint-{epoch}.pth")
-            torch.save(module, path)
+            torch.save(module.fc, path)
 
     dist.destroy_process_group()
 
