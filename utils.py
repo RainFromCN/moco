@@ -4,7 +4,12 @@ import os
 
 import torch
 from torch.distributed import init_process_group, get_world_size, all_gather, get_rank, broadcast
+import builtins
 
+
+def print(message):
+    if get_rank() == 0:
+        builtins.print(message)
 
 
 def setup_logging_system(args):

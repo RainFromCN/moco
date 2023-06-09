@@ -16,6 +16,7 @@ import utils
 import moco
 import data
 import time
+import pathlib
 
 
 def main_worker(local_rank, local_world_size, args):
@@ -108,15 +109,16 @@ def main_worker(local_rank, local_world_size, args):
 
         if epoch % args.save_ckp_freq == 0:
             # 保存checkpoint
-            path = os.path.join(args.output_dir, f'checkpoint-{epoch}.pth')
+            path = os.path.join(args.output_dir, 'pretrain',f'checkpoint-{epoch}.pth')
             torch.save(module.state_dict(), path)
 
-        destroy_process_group()
+    destroy_process_group()
 
 
 if __name__ == '__main__':
     args = config.parser.parse_args()
     utils.setup_logging_system(args)
+    pathlib.Path(os.path.join(args.output_dir, "pretrain")).mkdir(exist_ok=True)
 
     # 检查DDP参数是否正确
     if (args.use_ddp and args.master_addr and args.master_port 
