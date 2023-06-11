@@ -7,8 +7,10 @@ from torch.distributed import init_process_group, get_world_size, all_gather, ge
 import builtins
 
 
-def print(message):
-    if get_rank() == 0:
+def print(message, use_ddp):
+    if use_ddp and get_rank() == 0:
+        builtins.print(message)
+    elif not use_ddp:
         builtins.print(message)
 
 
@@ -74,3 +76,41 @@ def unshuffle(x, indices, use_ddp):
         return x_gather[local_reverse_indices]
     else:
         return x[torch.argsort(indices)]
+    
+
+def accuracy(output, target, topk=(1,)):
+    """Computes the accuracy over the k top predictions for the specified values of k"""
+    with torch.no_grad():
+        maxk = max(topk)
+        _, pred = output.topk(maxk, dim=-1, largest=True, sorted=True)
+        target = target.unsqueeze(-1).expand_as(pred)
+        table = pred == target
+        res = []
+        for k in topk:
+            acc = table[:, :k].sum().item() / output.shape[0]
+            res.append(acc * 100)
+        return res
+        
+
+
+class AverageMeter:
+    def __init__(self, name, type=float):
+        self.name = name
+        self.type = type
+        self.reset()
+
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
+
+    def __str__(self):
+        return f"{self.name}-{self.val:.4f}" if self.type is float else f"{self.name}-{self.val}"
+    

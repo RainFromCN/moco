@@ -16,7 +16,8 @@ import utils
 
 class Classifer(torch.nn.Module):
     def __init__(self, args):
-        self.backbone = models.__dict__[args.arch]
+        super().__init__()
+        self.backbone = models.__dict__[args.arch]()
         self.backbone.fc = nn.Linear(self.backbone.fc.in_features, args.num_cls)
 
         # 将主干网络的冻结
@@ -30,7 +31,7 @@ class Classifer(torch.nn.Module):
         state_dict = torch.load(path, map_location='cpu')
         for key, value in list(state_dict.items()):
             if key.startswith("query_encoder") and not key.startswith("query_encoder.fc"):
-                state_dict[key.lstrip("query_encoder.")] = value
+                state_dict[key.replace("query_encoder.", "", 1)] = value
             del state_dict[key]
         msg = self.backbone.load_state_dict(state_dict, strict=False)
         assert set(msg.missing_keys) == {"fc.weight", "fc.bias"}
@@ -39,10 +40,11 @@ class Classifer(torch.nn.Module):
         if args.use_ckp:
             assert args.use_ckp.startswith("checkpoint-") and args.use_ckp.endswith(".pth")
             path = os.path.join(args.output_dir, "classify", args.use_ckp)
-            self.backbone.fc.load_state_dict(torch.load(path, map_location='cpu'))
+            for param1, param2 in zip(self.backbone.fc.parameters(), torch.load(path, map_location='cpu').parameters()):
+                param1.data.copy_(param2)
         else:
             nn.init.xavier_uniform_(self.backbone.fc.weight)
-            nn.init.constant_(self.backbone.fc.bias)
+            nn.init.constant_(self.backbone.fc.bias, 0)
 
     
     def forward(self, x):
@@ -52,6 +54,8 @@ class Classifer(torch.nn.Module):
 class Augmentation:
     def __init__(self):
         self.aug = T.Compose([
+            T.RandomResizedCrop(224),
+            T.RandomHorizontalFlip(),
             T.ToTensor(),
             T.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
         ])
@@ -73,19 +77,18 @@ def config_parser():
 
     # 模型
     parser.add_argument("--arch", default="resnet50", type=str)
-    parser.add_argument("--embed_dim", default=256, type=int)
     parser.add_argument("--num_cls", default=1000, type=int)
 
     # 训练
     parser.add_argument("--lr", default=30, type=float)
     parser.add_argument("--weight_decay", default=0, type=float)
     parser.add_argument("--momentum", default=0.9, type=float)
-    parser.add_argument("--batch_size", default=128, type=int)
+    parser.add_argument("--batch_size", default=256, type=int)
     parser.add_argument("--epochs", default=100, type=int)
     parser.add_argument("--schedule", nargs='*', default=[60, 80], type=int)
     
     # 分布式
-    parser.add_argument("--use_ddp", default=True, type=bool)
+    parser.add_argument("--use_ddp", default=False, type=bool)
     parser.add_argument("--master_addr", default="localhost", type=str)
     parser.add_argument("--master_port", default="23333", type=str)
     parser.add_argument("--num_nodes", default=1, type=int)
@@ -96,18 +99,25 @@ def config_parser():
 
 
 def main_worker(local_rank, local_world_size, args):
+    top1 = utils.AverageMeter("Acc@1", float)
+    top5 = utils.AverageMeter("Acc@5", float)
+    losses = utils.AverageMeter("Loss", float)
+    batch_time = utils.AverageMeter("Time", float)
 
     # 加载模型
     module = Classifer(args).cuda(local_rank)
     loss = torch.nn.CrossEntropyLoss().cuda(local_rank)
+    module.eval()
 
     # 加载优化器
-    optimizer  = torch.optim.SGD(module.parameters() + loss.parameters(), lr=args.lr, momentum=args.momentum,
+    optimizer  = torch.optim.SGD([param for param in module.parameters() if param.requires_grad == True], 
+                                 lr=args.lr, momentum=args.momentum,
                                  weight_decay=args.weight_decay)
     scaler = GradScaler()
     
     # 加载数据集
     dataset = ImageFolder(root=args.path, transform=Augmentation())
+    sampler = DistributedSampler(dataset) if args.use_ddp else None
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True if args.use_ddp else False,
                         sampler=DistributedSampler(dataset) if args.use_ddp else None, num_workers=args.num_workers,
                         pin_memory=True, drop_last=True)
@@ -115,15 +125,23 @@ def main_worker(local_rank, local_world_size, args):
     # 配置DDP
     if args.use_ddp:
         utils.setup_ddp(local_rank, local_world_size, args)
-        utils.print("Use ddp for training.")
+        utils.print("Use ddp for training.", args.use_ddp)
         model = torch.nn.parallel.DistributedDataParallel(module, device_ids=[local_rank])
     else:
-        utils.print("Use single GPU for training.")
+        utils.print("Use single GPU for training.", args.use_ddp)
         model = module
 
+    # 查看是否使用checkpoint
+    if args.use_ckp:
+        start_epoch = int(args.use_ckp.replace("checkpoint-", "", 1).replace(".pth", "", 1))
+    else:
+        start_epoch = 0
 
     # 开始训练
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
+
+        if args.use_ddp:
+            sampler.set_epoch(epoch)
 
         utils.adjust_learning_rate(optimizer, epoch, args)
 
@@ -140,13 +158,18 @@ def main_worker(local_rank, local_world_size, args):
             scaler.step(optimizer)
             scaler.update()
 
-            utils.print(f"Iter-{i}\tLoss-{l.item():.5f}")
+            acc1, acc5 = utils.accuracy(logits, label, topk=(1,5))
+            losses.update(l.item())
+            top1.update(acc1)
+            top5.update(acc5)
+            utils.print(f"Iter-{i}\t{acc1}\t{acc5}\tLoss-{l.item():.5f}", args.use_ddp)
 
         if epoch % args.save_ckp_freq == 0:
-            path = os.path.join(args.output_dir, "classify", "checkpoint-{epoch}.pth")
-            torch.save(module.fc, path)
+            path = os.path.join(args.output_dir, "classify", f"checkpoint-{epoch}.pth")
+            torch.save(module.backbone.fc, path)
 
-    dist.destroy_process_group()
+    if args.use_ddp:
+        dist.destroy_process_group()
 
 
 if __name__ == '__main__':
@@ -163,4 +186,4 @@ if __name__ == '__main__':
     else:
         main_worker(0, 1, args)
 
-    utils.print("Training process is finished!")
+    utils.print("Training process is finished!", args.use_ddp)
