@@ -11,10 +11,10 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.distributed import destroy_process_group
 
-import config
-import utils
-import moco
-import data
+import pretrain.config as config
+import pretrain.utils as utils
+import pretrain.moco as moco
+import pretrain.data as data
 import time
 import pathlib
 
@@ -71,13 +71,16 @@ def main_worker(local_rank, local_world_size, args):
         start_epoch = 0
     
     # 开始训练
+    if local_rank == 0:
+        top1 = utils.AverageMeter("Acc@1", float)
+        top5 = utils.AverageMeter("Acc@5", float)
+        losses = utils.AverageMeter("Loss", float)
+        image_s = utils.AverageMeter("Image/s", float)
+
     for epoch in range(start_epoch, args.epochs):
         # 进行每个epoch必要的设置
         if args.use_ddp: sampler.set_epoch(epoch)
         utils.adjust_learning_rate(optimizer, epoch, args)
-
-        if local_rank == 0:
-            history_loss = []
 
         for iter, (images, _) in enumerate(loader):
             query_image, key_image = images[0].cuda(local_rank), images[1].cuda(local_rank)
@@ -98,14 +101,21 @@ def main_worker(local_rank, local_world_size, args):
 
             # 在控制台输出信息
             if local_rank == 0:
-                image_s = args.batch_size / (time.time() - mark)
-                print(f"Iter-{iter}\t{image_s} Images/s per GPU")
+                acc1, acc5 = utils.accuracy(output, target, (1,5))
+                top1.update(acc1)
+                top5.update(acc5)
+                losses.update(l.item())
+                image_s.update(args.batch_size / (time.time() - mark))
+                print(f"Iter-{iter}\t{image_s}\t{top1}\t{top5}\t{losses}")
                 mark = time.time()
-                history_loss.append(l.item())
         
         if local_rank == 0:
             # 保存epoch的训练日志
-            logging.info(f"Epoch:[{epoch}/{args.epochs}]  Loss:{sum(history_loss) / len(history_loss): .5f}")
+            utils.print(f"Epoch[{epoch}/{args.epochs}]: {top1}\t{top5}\t{losses}\t{image_s}")
+            top1.reset()
+            top5.reset()
+            losses.reset()
+            image_s.reset()
 
         if epoch % args.save_ckp_freq == 0:
             # 保存checkpoint

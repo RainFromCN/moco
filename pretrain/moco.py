@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.distributed as dist
 
 from torch.distributed import all_gather
-import utils
+import pretrain.utils as utils
 
 
 class MoCo(nn.Module):

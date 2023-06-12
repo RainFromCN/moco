@@ -11,7 +11,7 @@ import torch.distributed as dist
 from torch.cuda.amp import GradScaler
 from torch import autocast
 import torch.multiprocessing as mp
-import utils
+import pretrain.utils as utils
 
 
 class Classifer(torch.nn.Module):
@@ -68,12 +68,12 @@ def config_parser():
     parser = argparse.ArgumentParser("classify")
 
     # MISC
-    parser.add_argument("path", type=str)
-    parser.add_argument("pretrain", type=str)
-    parser.add_argument("--output_dir", default='./output', type=str)
+    parser.add_argument("path", type=str, help="训练集数据路径")
+    parser.add_argument("pretrain", type=str, help="使用pretrain参数文件名，参数路径应为<output_dir>/pretrain/checkpoint-xx.pth")
+    parser.add_argument("--output_dir", default='./output', type=str, help="输出路径")
     parser.add_argument("--num_workers", default=16, type=int)
-    parser.add_argument("--save_ckp_freq", default=1, type=int)
-    parser.add_argument("--use_ckp", default=None, type=str)
+    parser.add_argument("--save_ckp_freq", default=1, type=int, help="多久保存一个checkpoint")
+    parser.add_argument("--use_ckp", default=None, type=str, help="checkpoint路径，应为<output_dir>/classify/checkpoint-xx.pth")
 
     # 模型
     parser.add_argument("--arch", default="resnet50", type=str)
@@ -102,7 +102,6 @@ def main_worker(local_rank, local_world_size, args):
     top1 = utils.AverageMeter("Acc@1", float)
     top5 = utils.AverageMeter("Acc@5", float)
     losses = utils.AverageMeter("Loss", float)
-    batch_time = utils.AverageMeter("Time", float)
 
     # 加载模型
     module = Classifer(args).cuda(local_rank)
@@ -162,7 +161,13 @@ def main_worker(local_rank, local_world_size, args):
             losses.update(l.item())
             top1.update(acc1)
             top5.update(acc5)
-            utils.print(f"Iter-{i}\t{acc1}\t{acc5}\tLoss-{l.item():.5f}", args.use_ddp)
+
+        if local_rank == 0:
+            # 保存epoch的训练日志
+            utils.print(f"Epoch[{epoch}/{args.epochs}]: {top1.average}\t{top5.average}\t{losses.average}")
+            top1.reset()
+            top5.reset()
+            losses.reset()
 
         if epoch % args.save_ckp_freq == 0:
             path = os.path.join(args.output_dir, "classify", f"checkpoint-{epoch}.pth")

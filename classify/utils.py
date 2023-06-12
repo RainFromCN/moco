@@ -111,6 +111,10 @@ class AverageMeter:
         self.count += n
         self.avg = self.sum / self.count
 
+    @property
+    def average(self):
+        return f"{self.name}-{self.avg:.4f}" if self.type is float else f"{self.name}-{self.avg}"
+
     def __str__(self):
         return f"{self.name}-{self.val:.4f}" if self.type is float else f"{self.name}-{self.val}"
     
