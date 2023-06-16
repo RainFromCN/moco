@@ -11,7 +11,6 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.distributed import destroy_process_group
 
-import pretrain.config as config
 import pretrain.utils as utils
 import pretrain.moco as moco
 import pretrain.data as data
@@ -112,7 +111,7 @@ def main_worker(local_rank, local_world_size, args):
         if local_rank == 0:
             # 保存epoch的训练日志
             message = f"Epoch[{epoch}/{args.epochs}]: {top1.average}\t{top5.average}\t{losses.average}\t"
-            utils.print(message)
+            utils.print(message, args.use_ddp)
             logging.info(message)
 
     destroy_process_group()

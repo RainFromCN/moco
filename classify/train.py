@@ -164,7 +164,7 @@ def main_worker(local_rank, local_world_size, args):
 
         if local_rank == 0:
             # 保存epoch的训练日志
-            utils.print(f"Epoch[{epoch}/{args.epochs}]: {top1.average}\t{top5.average}\t{losses.average}")
+            utils.print(f"Epoch[{epoch}/{args.epochs}]: {top1.average}\t{top5.average}\t{losses.average}", args.use_ddp)
             top1.reset()
             top5.reset()
             losses.reset()
@@ -191,4 +191,4 @@ if __name__ == '__main__':
     else:
         main_worker(0, 1, args)
 
-    utils.print("Training process is finished!", args.use_ddp)
+    print("Training process is finished!")

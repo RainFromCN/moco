@@ -126,7 +126,7 @@ def main_worker(local_rank, local_world_size, args):
             top5.update(acc5)
             losses.update(l.item())
 
-    print(f"{top1.average}\t{top5.average}\t{losses.average}")
+    utils.print(f"{top1.average}\t{top5.average}\t{losses.average}", args.use_ddp)
 
     if args.use_ddp:
         dist.destroy_process_group()
