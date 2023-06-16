@@ -11,7 +11,7 @@ import torch.distributed as dist
 from torch.cuda.amp import GradScaler
 from torch import autocast
 import torch.multiprocessing as mp
-import pretrain.utils as utils
+import utils
 
 
 class Classifer(torch.nn.Module):
