@@ -17,6 +17,35 @@ import pretrain.moco as moco
 import pretrain.data as data
 import time
 import pathlib
+import argparse
+
+
+def get_parser():
+    parser = argparse.ArgumentParser("moco pretrain evaluator")
+
+    # 必选参数
+    parser.add_argument("path", type=str)
+
+    # 关于模型结构
+    parser.add_argument("--arch", default="resnet50")
+    parser.add_argument("--embed_dim", default=128, type=int)
+    parser.add_argument("--num_neg_samples", default=65536, type=int)
+    parser.add_argument("--temp", default=0.07, type=float)
+
+    # 关于训练
+    parser.add_argument("--batch_size", default=256, type=int)
+    parser.add_argument("--num_workers", default=16, type=int)
+
+    # 关于分布式训练
+    parser.add_argument("--use_ddp", default=False, type=bool)
+    parser.add_argument("--master_addr", default="localhost", type=str)
+    parser.add_argument("--master_port", default="23333", type=str)
+    parser.add_argument("--num_nodes", default=1, type=int)
+    parser.add_argument("--this_node_id", default=0, type=int)
+    parser.add_argument("--dist_backend", default="nccl", type=str)    
+
+    return parser
+
 
 
 def main_worker(local_rank, local_world_size, args):
@@ -30,25 +59,21 @@ def main_worker(local_rank, local_world_size, args):
     """
     if local_rank != 0:
         time.sleep(1)
+    else:
+        utils.setup_logging_system(args)
     
     # 定义模型
     encoder = models.__dict__[args.arch]
     model = moco.MoCo(encoder, args.embed_dim, args.num_neg_samples, args.temp, args.use_ddp)
     model = model.cuda(local_rank)
+    model.eval()
     loss = torch.nn.CrossEntropyLoss().cuda(local_rank)
+    loss.eval()
 
     # 将模型使用DDP进行装饰
     if args.use_ddp:
         utils.setup_ddp(local_rank, local_world_size, args)
         model = DDP(model, device_ids=[local_rank])
-        module = model.module
-    else:
-        module = model
-
-    # 定义优化器
-    optimizer = torch.optim.SGD(params=module.get_parameters(), momentum=args.momentum,
-                                lr=args.lr, weight_decay=args.weight_decay)
-    scaler = torch.cuda.amp.GradScaler()
 
     # 加载数据
     aug = data.TwoCropsWrapper(data.MoCoDataAugmentation())
@@ -58,31 +83,18 @@ def main_worker(local_rank, local_world_size, args):
                         shuffle=False if args.use_ddp else True,
                         pin_memory=True, num_workers=args.num_workers, drop_last=True)
     
-    # 检查是否使用check point
-    mark = time.time()
-    if args.use_ckp:
-        assert args.use_ckp.startswith("checkpoint-")
-        assert args.use_ckp.endswith(".pth")
-        start_epoch = int(args.use_ckp.lstrip("checkpoint-").rstrip(".pth"))
-        path = os.path.join(args.output_dir, "pretrain", args.use_ckp)
-        module.load_state_dict(torch.load(path))
-        logging.info(f"Use {args.use_ckp} to training.")
-    else:
-        start_epoch = 0
-    
     # 开始训练
     if local_rank == 0:
         top1 = utils.AverageMeter("Acc@1", float)
         top5 = utils.AverageMeter("Acc@5", float)
         losses = utils.AverageMeter("Loss", float)
-        image_s = utils.AverageMeter("Image/s", float)
 
-    for epoch in range(start_epoch, args.epochs):
+    
+    for epoch in range(args.epochs):
         # 进行每个epoch必要的设置
         if args.use_ddp: sampler.set_epoch(epoch)
-        utils.adjust_learning_rate(optimizer, epoch, args)
 
-        for iter, (images, _) in enumerate(loader):
+        for images, _ in loader:
             query_image, key_image = images[0].cuda(local_rank), images[1].cuda(local_rank)
             
             # 获取模型的输出
@@ -90,45 +102,26 @@ def main_worker(local_rank, local_world_size, args):
                 output, target = model(query_image, key_image)
                 l = loss(output, target)
 
-            # 更新query encoder
-            optimizer.zero_grad()
-            scaler.scale(l).backward()
-            scaler.step(optimizer)
-            scaler.update()
-
-            # 更新key encoder
-            utils.update_key_encoder(module, args)
-
             # 在控制台输出信息
             if local_rank == 0:
                 acc1, acc5 = utils.accuracy(output, target, (1,5))
                 top1.update(acc1)
                 top5.update(acc5)
                 losses.update(l.item())
-                image_s.update(args.batch_size / (time.time() - mark))
-                print(f"Iter-{iter}\t{image_s}\t{top1}\t{top5}\t{losses}")
-                mark = time.time()
         
         if local_rank == 0:
             # 保存epoch的训练日志
-            utils.print(f"Epoch[{epoch}/{args.epochs}]: {top1}\t{top5}\t{losses}\t{image_s}")
-            top1.reset()
-            top5.reset()
-            losses.reset()
-            image_s.reset()
-
-        if epoch % args.save_ckp_freq == 0:
-            # 保存checkpoint
-            path = os.path.join(args.output_dir, 'pretrain', f'checkpoint-{epoch}.pth')
-            torch.save(module.state_dict(), path)
+            message = f"Epoch[{epoch}/{args.epochs}]: {top1.average}\t{top5.average}\t{losses.average}\t"
+            utils.print(message)
+            logging.info(message)
 
     destroy_process_group()
 
 
 if __name__ == '__main__':
-    args = config.parser.parse_args()
-    utils.setup_logging_system(args)
+    args = get_parser().parse_args()
     pathlib.Path(os.path.join(args.output_dir, "pretrain")).mkdir(exist_ok=True)
+    utils.setup_logging_system(args)
 
     # 检查DDP参数是否正确
     if (args.use_ddp and args.master_addr and args.master_port 
