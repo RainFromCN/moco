@@ -7,17 +7,14 @@ from torch.distributed import init_process_group, get_world_size, all_gather, ge
 import builtins
 
 
-def print(message, use_ddp):
-    if use_ddp and get_rank() == 0:
-        builtins.print(message)
-    elif not use_ddp:
-        builtins.print(message)
-
-
-def setup_logging_system(args):
-    pathlib.Path(args.output_dir).mkdir(exist_ok=True)
-    path = os.path.join(args.output_dir, 'moco.log')
-    logging.basicConfig(filename=path, level=logging.INFO)
+def save_checkpoint(file_path, model, optimizer, epoch, args):
+    state_dict = {
+        "model": model,
+        "optimizer": optimizer,
+        "epoch": epoch,
+        "args": args,
+    }
+    torch.save(state_dict, file_path)
 
 
 def setup_ddp(local_rank, local_world_size, args):
@@ -53,29 +50,22 @@ def concat_all_gather(x):
 
 
 @torch.no_grad()
-def shuffle(x, use_ddp):
-    if use_ddp:
-        x_gather = concat_all_gather(x)
-        indices = torch.randperm(x_gather.shape[0]).to(x.device)
-        broadcast(indices, src=0)
-        start = get_rank() * x.shape[0]
-        local_indices = indices[start: start + x.shape[0]]
-        return x_gather[local_indices], indices
-    else:
-        indices = torch.randperm(x.shape[0]).to(x.device)
-        return x[indices], indices
+def shuffle(x):
+    x_gather = concat_all_gather(x)
+    indices = torch.randperm(x_gather.shape[0]).to(x.device)
+    broadcast(indices, src=0)
+    start = get_rank() * x.shape[0]
+    local_indices = indices[start: start + x.shape[0]]
+    return x_gather[local_indices], indices
 
 
 @torch.no_grad()
-def unshuffle(x, indices, use_ddp):
-    if use_ddp:
-        x_gather = concat_all_gather(x)
-        start = get_rank() * x.shape[0]
-        reverse_indices = torch.argsort(indices)
-        local_reverse_indices = reverse_indices[start: start + x.shape[0]]
-        return x_gather[local_reverse_indices]
-    else:
-        return x[torch.argsort(indices)]
+def unshuffle(x, indices):
+    x_gather = concat_all_gather(x)
+    start = get_rank() * x.shape[0]
+    reverse_indices = torch.argsort(indices)
+    local_reverse_indices = reverse_indices[start: start + x.shape[0]]
+    return x_gather[local_reverse_indices]
     
 
 def accuracy(output, target, topk=(1,)):

@@ -31,11 +31,10 @@ parser.add_argument("--key_encoder_momentum", default=0.999, type=float)
 parser.add_argument("--num_workers", default=16, type=int)
 
 # 关于分布式训练
-parser.add_argument("--use_ddp", default=False, type=bool)
-parser.add_argument("--master_addr", default=None, type=str)
-parser.add_argument("--master_port", default=None, type=str)
-parser.add_argument("--num_nodes", default=None, type=int)
-parser.add_argument("--this_node_id", default=None, type=int)
+parser.add_argument("--master_addr", default="localhost", type=str)
+parser.add_argument("--master_port", default="23333", type=str)
+parser.add_argument("--num_nodes", default=1, type=int)
+parser.add_argument("--this_node_id", default=0, type=int)
 parser.add_argument("--dist_backend", default="nccl", type=str)
 
 # MISC

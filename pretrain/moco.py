@@ -1,13 +1,9 @@
 import torch
 import torch.nn as nn
-import torch.distributed as dist
-
-from torch.distributed import all_gather
-import pretrain.utils as utils
-
+import utils
 
 class MoCo(nn.Module):
-    def __init__(self, encoder, embed_dim, num_neg_samples, temp, use_ddp):
+    def __init__(self, encoder, embed_dim, num_neg_samples, temp):
         """
         MoCo
 
@@ -19,7 +15,6 @@ class MoCo(nn.Module):
         """
         super().__init__()
         self.temp = temp
-        self.use_ddp = use_ddp
 
         # 设置neg samples队列
         self.register_buffer("queue", torch.rand(num_neg_samples, embed_dim))
@@ -45,8 +40,7 @@ class MoCo(nn.Module):
     
 
     def update_queue(self, key_feat):
-        if self.use_ddp:
-            key_feat = utils.concat_all_gather(key_feat)
+        key_feat = utils.concat_all_gather(key_feat)
 
         # 更新队列
         batch_size = key_feat.shape[0]
@@ -72,9 +66,9 @@ class MoCo(nn.Module):
         query_feat = self.query_encoder(query_image)
         query_feat = torch.nn.functional.normalize(query_feat, p=2, dim=-1)
         with torch.no_grad():
-            key_image, indices = utils.shuffle(key_image, self.use_ddp)
+            key_image, indices = utils.shuffle(key_image)
             key_feat = self.key_encoder(key_image)
-            key_feat = utils.unshuffle(key_feat, indices, self.use_ddp)
+            key_feat = utils.unshuffle(key_feat, indices)
             key_feat = torch.nn.functional.normalize(key_feat, p=2, dim=-1)
         
         # 计算相似度, 每个样本共有1个positive sample和K个negative samples
@@ -83,7 +77,7 @@ class MoCo(nn.Module):
         logits = torch.cat([l_pos, l_neg], dim=-1) / self.temp
 
         # 期望分布
-        target = torch.cat([torch.ones_like(l_pos), torch.zeros_like(l_neg)], dim=-1).to(logits.device)
+        target = torch.zeros(logits.shape[0], dtype=torch.long).to(logits.device)
 
         # 更新队列
         self.update_queue(key_feat)
