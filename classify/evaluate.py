@@ -72,7 +72,6 @@ def config_parser():
     parser.add_argument("--batch_size", default=256, type=int)
     
     # 分布式
-    parser.add_argument("--use_ddp", default=False, type=bool)
     parser.add_argument("--master_addr", default="localhost", type=str)
     parser.add_argument("--master_port", default="23333", type=str)
     parser.add_argument("--num_nodes", default=1, type=int)

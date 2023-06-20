@@ -7,11 +7,18 @@ import torch.nn as nn
 import torchvision.transforms as T
 from torchvision.datasets import ImageFolder
 from torch.utils.data import DataLoader, DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 from torch.cuda.amp import GradScaler
 from torch import autocast
 import torch.multiprocessing as mp
 import utils
+import builtins
+import time
+
+
+def print_pass(msg):
+    ...
 
 
 class Classifer(torch.nn.Module):
@@ -28,23 +35,17 @@ class Classifer(torch.nn.Module):
         # 加载backbone的预训练参数
         path = os.path.join(args.output_dir, "pretrain", args.pretrain)
         assert os.path.exists(path)
-        state_dict = torch.load(path, map_location='cpu')
+        state_dict = torch.load(path, map_location='cpu')['model']
         for key, value in list(state_dict.items()):
-            if key.startswith("query_encoder") and not key.startswith("query_encoder.fc"):
-                state_dict[key.replace("query_encoder.", "", 1)] = value
+            if key.startswith("module.query_encoder") and not key.startswith("module.query_encoder.fc"):
+                state_dict[key.replace("module.query_encoder.", "", 1)] = value
             del state_dict[key]
         msg = self.backbone.load_state_dict(state_dict, strict=False)
         assert set(msg.missing_keys) == {"fc.weight", "fc.bias"}
         
-        # 初始化全连接层
-        if args.use_ckp:
-            assert args.use_ckp.startswith("checkpoint-") and args.use_ckp.endswith(".pth")
-            path = os.path.join(args.output_dir, "classify", args.use_ckp)
-            for param1, param2 in zip(self.backbone.fc.parameters(), torch.load(path, map_location='cpu').parameters()):
-                param1.data.copy_(param2)
-        else:
-            nn.init.xavier_uniform_(self.backbone.fc.weight)
-            nn.init.constant_(self.backbone.fc.bias, 0)
+        # 初始化参数
+        nn.init.xavier_uniform_(self.backbone.fc.weight)
+        nn.init.constant_(self.backbone.fc.bias, 0)
 
     
     def forward(self, x):
@@ -72,8 +73,6 @@ def config_parser():
     parser.add_argument("pretrain", type=str, help="使用pretrain参数文件名，参数路径应为<output_dir>/pretrain/checkpoint-xx.pth")
     parser.add_argument("--output_dir", default='./output', type=str, help="输出路径")
     parser.add_argument("--num_workers", default=16, type=int)
-    parser.add_argument("--save_ckp_freq", default=1, type=int, help="多久保存一个checkpoint")
-    parser.add_argument("--use_ckp", default=None, type=str, help="checkpoint路径，应为<output_dir>/classify/checkpoint-xx.pth")
 
     # 模型
     parser.add_argument("--arch", default="resnet50", type=str)
@@ -88,60 +87,52 @@ def config_parser():
     parser.add_argument("--schedule", nargs='*', default=[60, 80], type=int)
     
     # 分布式
-    parser.add_argument("--use_ddp", default=False, type=bool)
     parser.add_argument("--master_addr", default="localhost", type=str)
     parser.add_argument("--master_port", default="23333", type=str)
     parser.add_argument("--num_nodes", default=1, type=int)
     parser.add_argument("--this_node_id", default=0, type=int)
     parser.add_argument("--dist_backend", default="nccl", type=str)
 
+    # 结果保存
+    parser.add_argument("--save_ckp_freq", default=1, type=int)
+
     return parser
 
 
 def main_worker(local_rank, local_world_size, args):
-    top1 = utils.AverageMeter("Acc@1", float)
-    top5 = utils.AverageMeter("Acc@5", float)
-    losses = utils.AverageMeter("Loss", float)
+
+    if local_rank != 0:
+        builtins.print = print_pass
+        time.sleep(1)
+        
+    # 配置DDP
+    utils.setup_ddp(local_rank, local_world_size, args)
 
     # 加载模型
-    module = Classifer(args).cuda(local_rank)
+    model = Classifer(args).cuda(local_rank)
+    model.eval()
+    model = DDP(model, device_ids=[local_rank])
     loss = torch.nn.CrossEntropyLoss().cuda(local_rank)
-    module.eval()
 
     # 加载优化器
-    optimizer  = torch.optim.SGD([param for param in module.parameters() if param.requires_grad == True], 
+    optimizer  = torch.optim.SGD([param for param in model.module.parameters() if param.requires_grad == True], 
                                  lr=args.lr, momentum=args.momentum,
                                  weight_decay=args.weight_decay)
     scaler = GradScaler()
     
     # 加载数据集
     dataset = ImageFolder(root=args.path, transform=Augmentation())
-    sampler = DistributedSampler(dataset) if args.use_ddp else None
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True if args.use_ddp else False,
-                        sampler=DistributedSampler(dataset) if args.use_ddp else None, num_workers=args.num_workers,
+    sampler = DistributedSampler(dataset)
+    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False,
+                        sampler=sampler, num_workers=args.num_workers,
                         pin_memory=True, drop_last=True)
-    
-    # 配置DDP
-    if args.use_ddp:
-        utils.setup_ddp(local_rank, local_world_size, args)
-        utils.print("Use ddp for training.", args.use_ddp)
-        model = torch.nn.parallel.DistributedDataParallel(module, device_ids=[local_rank])
-    else:
-        utils.print("Use single GPU for training.", args.use_ddp)
-        model = module
-
-    # 查看是否使用checkpoint
-    if args.use_ckp:
-        start_epoch = int(args.use_ckp.replace("checkpoint-", "", 1).replace(".pth", "", 1))
-    else:
-        start_epoch = 0
 
     # 开始训练
-    for epoch in range(start_epoch, args.epochs):
-
-        if args.use_ddp:
-            sampler.set_epoch(epoch)
-
+    for epoch in range(args.epochs):
+        top1 = utils.AverageMeter("Acc@1", float)
+        top5 = utils.AverageMeter("Acc@5", float)
+        losses = utils.AverageMeter("Loss", float)
+        sampler.set_epoch(epoch)
         utils.adjust_learning_rate(optimizer, epoch, args)
 
         for i, (data, label) in enumerate(loader):
@@ -162,19 +153,13 @@ def main_worker(local_rank, local_world_size, args):
             top1.update(acc1)
             top5.update(acc5)
 
-        if local_rank == 0:
-            # 保存epoch的训练日志
-            utils.print(f"Epoch[{epoch}/{args.epochs}]: {top1.average}\t{top5.average}\t{losses.average}", args.use_ddp)
-            top1.reset()
-            top5.reset()
-            losses.reset()
+        # 保存epoch的训练日志
+        print(f"Epoch[{epoch}/{args.epochs}]: {top1.average}\t{top5.average}\t{losses.average}")
 
-        if epoch % args.save_ckp_freq == 0:
-            path = os.path.join(args.output_dir, "classify", f"checkpoint-{epoch}.pth")
-            torch.save(module.backbone.fc, path)
+    path = os.path.join(args.output_dir, "classify", f"checkpoint-{args.epochs}.pth")
+    torch.save(model.module.backbone.fc)
 
-    if args.use_ddp:
-        dist.destroy_process_group()
+    dist.destroy_process_group()
 
 
 if __name__ == '__main__':
@@ -185,10 +170,7 @@ if __name__ == '__main__':
     os.environ["MASTER_ADDR"] = args.master_addr
     os.environ["MASTER_PORT"] = args.master_port
 
-    if args.use_ddp:
-        local_world_size = torch.cuda.device_count()
-        mp.spawn(main_worker, args=(local_world_size, args), nprocs=local_world_size, join=True)
-    else:
-        main_worker(0, 1, args)
+    local_world_size = torch.cuda.device_count()
+    mp.spawn(main_worker, args=(local_world_size, args), nprocs=local_world_size, join=True)
 
     print("Training process is finished!")
