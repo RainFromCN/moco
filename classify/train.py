@@ -93,9 +93,6 @@ def config_parser():
     parser.add_argument("--this_node_id", default=0, type=int)
     parser.add_argument("--dist_backend", default="nccl", type=str)
 
-    # 结果保存
-    parser.add_argument("--save_ckp_freq", default=1, type=int)
-
     return parser
 
 
@@ -156,8 +153,9 @@ def main_worker(local_rank, local_world_size, args):
         # 保存epoch的训练日志
         print(f"Epoch[{epoch}/{args.epochs}]: {top1.average}\t{top5.average}\t{losses.average}")
 
-    path = os.path.join(args.output_dir, "classify", f"checkpoint-{args.epochs}.pth")
-    torch.save(model.module.backbone.fc)
+    if local_rank == 0:
+        path = os.path.join(args.output_dir, "classify", f"checkpoint-{args.epochs}.pth")
+        torch.save(model.module.backbone.fc, path)
 
     dist.destroy_process_group()
 

@@ -66,7 +66,7 @@ def unshuffle(x, indices):
     reverse_indices = torch.argsort(indices)
     local_reverse_indices = reverse_indices[start: start + x.shape[0]]
     return x_gather[local_reverse_indices]
-    
+
 
 def accuracy(output, target, topk=(1,)):
     """Computes the accuracy over the k top predictions for the specified values of k"""
